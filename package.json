@@ -1,0 +1,42 @@
+{
+  "name": "toolbed",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p . && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc -p .",
+    "test:e2e": "python3 scripts/e2e_browser.py test-results"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "jsdom": "^30.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.2"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.0",
+    "clipper-lib": "^6.4.2",
+    "comlink": "^4.4.2",
+    "fflate": "^0.8.3",
+    "idb-keyval": "^6.3.0",
+    "jspdf": "^4.2.1",
+    "lucide-react": "^1.48.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "replicad": "^1.1.0",
+    "replicad-opencascadejs": "^1.1.0",
+    "three": "^0.186.1",
+    "zustand": "^5.0.15"
+  }
+}
