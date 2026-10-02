@@ -1,8 +1,10 @@
 // Fit the paper's four corners from a segmentation mask.
 //
 // Tools lying across the paper edge punch notches into its mask, so touching tool masks are
-// merged back first. Then: convex hull → rough quadrilateral → each side refit as a straight
-// line through the boundary points near it (ignoring outliers), corners = line intersections.
+// merged back first, clipped to the sheet's own convex hull so the part of a tool hanging off
+// the paper can't drag a side outwards. Then: convex hull → rough quadrilateral → each side
+// refit as a straight line through the boundary points near it (ignoring outliers), corners =
+// line intersections.
 import { closeMask, masksTouch, traceOuter, unionMasks, type Mask, type Vec2 } from "./mask";
 
 function cross(o: Vec2, a: Vec2, b: Vec2) {
@@ -110,9 +112,33 @@ export interface PaperFit {
   fill: number;
 }
 
+/** Rasterise a polygon (pixel-corner coordinates), sampling pixel centres. */
+function fillPolygon(poly: Vec2[], w: number, h: number): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const py = y + 0.5, xs: number[] = [];
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const [xi, yi] = poly[i], [xj, yj] = poly[j];
+      if (yi > py !== yj > py) xs.push(((xj - xi) * (py - yi)) / (yj - yi) + xi);
+    }
+    xs.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      for (let x = Math.max(0, Math.ceil(xs[k] - 0.5)); x <= Math.min(w - 1, Math.floor(xs[k + 1] - 0.5)); x++) out[y * w + x] = 1;
+    }
+  }
+  return out;
+}
+
 export function fitPaper(paper: Mask, tools: Mask[] = []): PaperFit {
   let m = paper;
-  for (const t of tools) if (masksTouch(t, m)) m = unionMasks(m, t);
+  let sheet: Uint8Array | null = null;
+  for (const t of tools) {
+    if (!masksTouch(t, m)) continue;
+    sheet ??= fillPolygon(convexHull(traceOuter(paper)), paper.width, paper.height);
+    const clipped = new Uint8Array(t.data.length);
+    for (let i = 0; i < clipped.length; i++) clipped[i] = t.data[i] & sheet[i];
+    m = unionMasks(m, { data: clipped, width: t.width, height: t.height });
+  }
   const r = Math.max(2, Math.round(Math.min(m.width, m.height) / 300));
   m = closeMask(m, r);
   const outline = traceOuter(m);

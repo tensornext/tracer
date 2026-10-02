@@ -50,10 +50,50 @@ function cutoutDrawing(shape: CutoutShape, tol: number, polygonRegions: Region[]
   }
 }
 
-const prism = (d: Drawing, z0: number, height: number): Shape3D =>
-  (d.sketchOnPlane("XY", z0) as { extrude(h: number): Shape3D }).extrude(height);
+function prism(d: Drawing, z0: number, height: number): Shape3D {
+  // A zero-height solid makes OpenCascade spin forever in a later boolean, so refuse it here.
+  if (!(Math.abs(height) > 1e-6)) throw new Error(`Can't make a solid ${height} mm thick: thicknesses and depths must be more than 0`);
+  return (d.sketchOnPlane("XY", z0) as { extrude(h: number): Shape3D }).extrude(height);
+}
 
-const cutAll = (base: Shape3D, tools: Shape3D[]): Shape3D => tools.reduce((acc, t) => acc.cut(t), base);
+type Box = [[number, number, number], [number, number, number]];
+const apart = (a: Box, b: Box, gap = 0.01) => [0, 1, 2].some((k) => a[1][k] + gap < b[0][k] || b[1][k] + gap < a[0][k]);
+
+/** Greedy split into groups whose members' bounding boxes don't even touch. */
+function disjointGroups(tools: Shape3D[]): Shape3D[][] {
+  const groups: { tools: Shape3D[]; boxes: Box[] }[] = [];
+  for (const t of tools) {
+    const box = t.boundingBox.bounds as Box;
+    const g = groups.find((x) => x.boxes.every((b) => apart(box, b)));
+    if (g) { g.tools.push(t); g.boxes.push(box); } else groups.push({ tools: [t], boxes: [box] });
+  }
+  return groups.map((g) => g.tools);
+}
+
+/**
+ * Cutting tools one at a time re-intersects an ever-growing solid, which goes quadratic (four
+ * magnet holes per cell made big bins take minutes). Instead cut each group of well-separated
+ * tools as one compound. Tools that overlap or touch go in different groups: inside one
+ * boolean they give silently wrong results. `tools` stay usable afterwards.
+ */
+function cutAll(base: Shape3D, tools: Shape3D[]): Shape3D {
+  for (const group of disjointGroups(tools)) {
+    if (group.length === 1) {
+      base = base.cut(group[0]);
+      continue;
+    }
+    const all = compoundShapes(group.map((t) => t.clone())) as unknown as Shape3D; // consumes its inputs
+    try {
+      base = base.cut(all);
+    } catch (e) {
+      console.warn("Combined cut failed, cutting one tool at a time:", e);
+      base = group.reduce((acc, t) => acc.cut(t), base);
+    } finally {
+      all.delete();
+    }
+  }
+  return base;
+}
 
 function friendlyError(e: unknown): Error {
   const msg = e instanceof Error ? e.message : String(e);
@@ -63,8 +103,7 @@ function friendlyError(e: unknown): Error {
 }
 
 function info(name: string, kind: PartKind, tile: number, solid: Shape3D): PartInfo {
-  const b = solid.boundingBox.bounds as [[number, number, number], [number, number, number]];
-  return { name, kind, tile, bounds: b };
+  return { name, kind, tile, bounds: solid.boundingBox.bounds as Box };
 }
 
 // ---------- planned cutouts → kernel drawings ----------
@@ -74,6 +113,8 @@ interface Prepared extends Planned {
 }
 
 function withDrawings(planned: Planned[], tol: number): Prepared[] {
+  // A degenerate stadium crashes (or stalls) OpenCascade, so catch it before any kernel work.
+  if (planned.some((x) => x.slot && !(x.slot.width > 0.5))) throw new Error("Finger slots need a finger diameter of more than 0.5 mm");
   return planned.map((x) => ({ ...x, drawings: cutoutDrawing(x.cutout.shape, tol, x.regions) }));
 }
 
@@ -195,9 +236,7 @@ export function buildGridfinity(cutouts: Cutout[], params: GridfinityParams = {}
     tray = cutAll(tray, slotSolids);
 
     // Pockets: each cut to its own depth, plus the contrast layer that gets filled back in.
-    for (const x of prepared) {
-      for (const d of x.drawings) tray = tray.cut(prism(shift(d), zTop - x.depth - c, x.depth + c + 0.05));
-    }
+    tray = cutAll(tray, prepared.flatMap((x) => x.drawings.map((d) => prism(shift(d), zTop - x.depth - c, x.depth + c + 0.05))));
 
     // Engraved labels (needs a font loaded with loadCadFont).
     if (getFont()) {
@@ -281,12 +320,10 @@ export function buildFoam(cutouts: Cutout[], params: FoamParams = {}): { width: 
     const prepared = withDrawings(planned, p.tolerance);
     const shift = (d: Drawing) => d.translate(-center[0], -center[1]);
     let cut = prism(drawRectangle(width, height), p.backer, p.thickness);
-    const tools: Shape3D[] = [];
-    for (const x of prepared) {
-      for (const d of x.drawings) tools.push(prism(shift(d), p.backer - 0.05, p.thickness + 0.1));
-      if (x.slot) tools.push(prism(slotDrawing(x.slot, center), p.backer - 0.05, p.thickness + 0.1));
-    }
-    cut = cutAll(cut, tools);
+    const through = (d: Drawing) => prism(d, p.backer - 0.05, p.thickness + 0.1);
+    // Slots before pockets, as for Gridfinity: the other order can lose half a slot.
+    cut = cutAll(cut, prepared.flatMap((x) => (x.slot ? [through(slotDrawing(x.slot, center))] : [])));
+    cut = cutAll(cut, prepared.flatMap((x) => x.drawings.map((d) => through(shift(d)))));
     const parts: Part[] = [{ info: info("foam-cut", "foamCut", 0, cut), solid: cut }];
     if (p.backer > 0) {
       const backer = prism(drawRectangle(width, height), 0, p.backer);

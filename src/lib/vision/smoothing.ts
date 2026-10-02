@@ -20,7 +20,10 @@ export const SMOOTH_PRESETS: Record<"fast" | "detail", Required<SmoothOptions>> 
   detail: { step: 0.25, sigma: 0.4, epsilon: 0 },
 };
 
-/** Evenly resample a closed polyline every `step` mm. */
+/** Cap on resampled points, so a runaway outline (bad paper corners) can't freeze the page. */
+const MAX_SAMPLES = 20_000;
+
+/** Evenly resample a closed polyline every `step` mm (coarser if that would exceed MAX_SAMPLES). */
 export function resampleClosed(pts: Vec2[], step: number): Vec2[] {
   const n = pts.length;
   const seg: number[] = [];
@@ -31,8 +34,8 @@ export function resampleClosed(pts: Vec2[], step: number): Vec2[] {
     seg.push(d);
     total += d;
   }
-  if (total === 0) return pts.slice();
-  const count = Math.max(8, Math.round(total / step));
+  if (total === 0 || !Number.isFinite(total)) return pts.slice();
+  const count = Math.min(MAX_SAMPLES, Math.max(8, Math.round(total / step)));
   const spacing = total / count;
   const out: Vec2[] = [];
   let i = 0, acc = 0;

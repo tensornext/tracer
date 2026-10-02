@@ -16,9 +16,14 @@ export function frameFor(corners: Vec2[] | null, paper: Settings["paper"]): Pape
   }
 }
 
-/** Pixel outline → smoothed mm outline centred on its own centroid, plus where that centroid sits on the paper. */
-export function outlineFromPixels(outlinePx: Vec2[], frame: PaperFrame, detail: boolean): { local: Vec2[]; center: Vec2 } {
-  const mm = smoothOutline(outlineToMm(outlinePx, frame), detail ? "detail" : "fast");
+/**
+ * Pixel outline → smoothed mm outline centred on its own centroid, plus where that centroid sits
+ * on the paper. Null when these corners can't map the outline (it crosses the photo's horizon).
+ */
+export function outlineFromPixels(outlinePx: Vec2[], frame: PaperFrame, detail: boolean): { local: Vec2[]; center: Vec2 } | null {
+  const raw = outlineToMm(outlinePx, frame);
+  if (!raw) return null;
+  const mm = smoothOutline(raw, detail ? "detail" : "fast");
   const c = centroid(mm);
   return { local: mm.map(([x, y]) => [x - c[0], y - c[1]]), center: c };
 }
@@ -113,7 +118,13 @@ export function autoArrange(tools: ToolItem[], settings: Settings): Pick<ToolIte
   const total = items.reduce((s, i) => s + i.w, 0);
   const cell = settings.gridfinity.cellSize;
   let best: { cost: number; place: { id: string; x: number; y: number; rotation: number }[] } | null = null;
-  for (let rowW = widest; rowW <= Math.max(widest, total) + 1; rowW += 10) {
+  // 10 mm steps, coarser for huge layouts. Counted, not accumulated: at ~1e17 mm adding 10 does nothing.
+  const span = Math.max(widest, total) - widest;
+  if (!Number.isFinite(span)) return []; // a broken (NaN) outline: leave everything where it is
+  const stepW = Math.max(10, span / 200);
+  const tries = Math.floor((span + 1) / stepW);
+  for (let k = 0; k <= tries; k++) {
+    const rowW = widest + k * stepW;
     const place: { id: string; x: number; y: number; rotation: number }[] = [];
     let x = 0, y = 0, rowH = 0;
     for (const it of items) {
@@ -132,5 +143,5 @@ export function autoArrange(tools: ToolItem[], settings: Settings): Pick<ToolIte
     if (!best || cost < best.cost) best = { cost, place };
     if (rowW >= total) break;
   }
-  return best!.place;
+  return best?.place ?? [];
 }

@@ -27,7 +27,8 @@ def wait_idle(page, timeout=30):
     t0 = time.time()
     time.sleep(0.3)
     while time.time() - t0 < timeout:
-        busy = page.locator("text=/Tracing|Finding the paper/").count()
+        # The busy chip's text ends in "…"; a bare "Tracing" is the settings label and is always on screen.
+        busy = page.locator("text=/(Tracing|Finding the paper).*…/").count()
         if not busy:
             return
         time.sleep(0.2)

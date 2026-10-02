@@ -56,7 +56,9 @@ function rederive(tools: ToolItem[], corners: Vec2[] | null, settings: Settings)
   if (!frame) return tools;
   return tools.map((t) => {
     if (t.kind !== "traced" || !t.outlinePx || t.outlinePx.length < 3) return t;
-    const { local, center } = outlineFromPixels(t.outlinePx, frame, !!t.detail);
+    const derived = outlineFromPixels(t.outlinePx, frame, !!t.detail);
+    if (!derived) return t;
+    const { local, center } = derived;
     return t.placed ? { ...t, outline: local } : { ...t, outline: local, x: center[0], y: center[1] };
   });
 }
@@ -121,16 +123,25 @@ export function snapshot(): ProjectData {
   return { version: 1, image: s.image, corners: s.corners, cornersManual: s.cornersManual, tools: s.tools, settings: s.settings };
 }
 
+/** Saving is best-effort. idb-keyval opens the database synchronously, so blocked storage throws rather than rejects. */
+const quietly = async (f: () => Promise<unknown>) => {
+  try {
+    await f();
+  } catch {
+    // Storage unavailable (private mode, blocked site data): keep working without it.
+  }
+};
+
 let timer: ReturnType<typeof setTimeout> | undefined;
 export function startAutosave() {
   return useStore.subscribe((s, prev) => {
     if (s.tools === prev.tools && s.settings === prev.settings && s.corners === prev.corners && s.image === prev.image) return;
     clearTimeout(timer);
-    timer = setTimeout(() => void set(KEY, snapshot()).catch(() => {}), 600);
+    timer = setTimeout(() => void quietly(() => set(KEY, snapshot())), 600);
   });
 }
 
-export const saveImage = (blob: Blob) => set(IMAGE_KEY, blob).catch(() => {});
+export const saveImage = (blob: Blob) => quietly(() => set(IMAGE_KEY, blob));
 export const loadSaved = async (): Promise<{ project: ProjectData; image: Blob } | null> => {
   try {
     const [project, image] = await Promise.all([get<ProjectData>(KEY), get<Blob>(IMAGE_KEY)]);
@@ -139,4 +150,4 @@ export const loadSaved = async (): Promise<{ project: ProjectData; image: Blob }
     return null;
   }
 };
-export const clearSaved = () => Promise.all([del(KEY), del(IMAGE_KEY)]).catch(() => {});
+export const clearSaved = () => quietly(() => Promise.all([del(KEY), del(IMAGE_KEY)]));

@@ -35,6 +35,7 @@ export interface Planned {
 }
 
 export function planCutouts(cutouts: Cutout[], tol: number, defaultDepth: number, fingerDia: number): Planned[] {
+  if (!(fingerDia >= 1) && cutouts.some((c) => c.fingerSlot)) throw new Error("Finger slot width must be at least 1 mm");
   return cutouts.map((cutout) => {
     const pts = shapePoints(cutout.shape, 96);
     const regions = offsetPolygons([normalizePolygon(pts)], tol);
@@ -66,6 +67,10 @@ export function footprintBounds(planned: Planned[]) {
   return boundsOf(all);
 }
 
+const MAX_CELLS = 40;
+/** OpenCascade's peak heap grows with the cell count: about 600 cells reach 2.5 GB, 36×36 hits the 4 GB wasm32 limit. */
+const MAX_AREA = 600;
+
 export function planGridfinity(cutouts: Cutout[], params: GridfinityParams = {}): { layout: GridfinityLayout; planned: Planned[]; p: typeof GF_DEFAULTS } {
   const p = { ...GF_DEFAULTS, ...params };
   const planned = planCutouts(cutouts, p.tolerance, p.pocketDepth, p.fingerDiameter);
@@ -78,6 +83,10 @@ export function planGridfinity(cutouts: Cutout[], params: GridfinityParams = {})
   const autoY = Math.max(1, Math.ceil((needD + p.clearance) / p.cellSize));
   const cellsX = params.cellsX ?? autoX;
   const cellsY = params.cellsY ?? autoY;
+  // Far past any drawer; usually a sign of misplaced paper corners. Building it would take forever.
+  if (cellsX > MAX_CELLS || cellsY > MAX_CELLS || cellsX * cellsY > MAX_AREA) {
+    throw new Error(`This bin would be ${cellsX}×${cellsY} cells. Check the paper corners and pocket sizes`);
+  }
   if (cellsX < autoX || cellsY < autoY) {
     throw new Error(`Cutouts need at least ${autoX}×${autoY} cells; ${cellsX}×${cellsY} was requested`);
   }
@@ -109,6 +118,9 @@ export interface FoamPlan {
 
 export function planFoam(cutouts: Cutout[], params: FoamParams = {}): FoamPlan {
   const p = { ...FOAM_DEFAULTS, ...params };
+  // A zero-height cut layer sends OpenCascade into an endless loop, so stop it here.
+  if (!(p.thickness > 0)) throw new Error("Cut layer thickness must be more than 0");
+  if (!(p.backer >= 0)) throw new Error("Backer thickness can't be negative");
   const planned = planCutouts(cutouts, p.tolerance, 0, p.fingerDiameter);
   const b = footprintBounds(planned);
   const has = planned.length > 0;

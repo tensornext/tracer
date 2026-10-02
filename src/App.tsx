@@ -23,8 +23,10 @@ export function App() {
   // Restore the last session, then autosave from here on.
   useEffect(() => {
     let stop: (() => void) | undefined;
+    let cancelled = false; // StrictMode runs this effect twice in development
     void (async () => {
       const saved = await loadSaved();
+      if (cancelled) return;
       if (saved?.project.image) {
         try {
           useStore.getState().loadProject(saved.project);
@@ -34,10 +36,11 @@ export function App() {
           useStore.getState().resetProject();
         }
       }
+      if (cancelled) return;
       setRestoring(false);
       stop = startAutosave();
     })();
-    return () => stop?.();
+    return () => { cancelled = true; stop?.(); };
   }, []);
 
   const onFile = useCallback(async (f: File) => {
@@ -49,9 +52,13 @@ export function App() {
   }, [notify]);
 
   const onSample = useCallback(async () => {
-    const blob = await (await fetch("/sample.jpg")).blob();
-    await openImage(blob, "sample.jpg");
-  }, []);
+    try {
+      const blob = await (await fetch("/sample.jpg")).blob();
+      await openImage(blob, "sample.jpg");
+    } catch {
+      notify({ tone: "error", text: "The sample photo couldn't be loaded." });
+    }
+  }, [notify]);
 
   const onNew = useCallback(async () => {
     if (useStore.getState().tools.length && !confirm("Start a new project? The current photo and traces will be cleared.")) return;

@@ -69,6 +69,22 @@ describe("paper fit", () => {
     expect(fit.fill).toBeGreaterThan(0.95);
   });
 
+  it("doesn't let the off-paper part of a tool drag the corners", () => {
+    // A 2048 px photo with a long tool across the right edge at 60°. Merging the whole tool mask
+    // used to collapse two corners into one, and the homography then froze the page.
+    const W2 = 2048, H2 = 1536;
+    const sheet: Vec2[] = [[550, 154], [1500, 154], [1500, 1384], [550, 1384]];
+    const a = Math.PI / 3, c = Math.cos(a), s = Math.sin(a);
+    const bar = ([[-440, -28], [440, -28], [440, 28], [-440, 28]] as Vec2[]).map(([x, y]) => [1500 + x * c - y * s, 760 + x * s + y * c] as Vec2);
+    const paper = blank(W2, H2), tool = blank(W2, H2);
+    fillPoly(paper, sheet);
+    fillPoly(tool, bar);
+    for (let i = 0; i < paper.data.length; i++) if (tool.data[i]) paper.data[i] = 0;
+    const fit = fitPaper(paper, [tool]);
+    const err = fit.corners.map((p, i) => Math.hypot(p[0] - sheet[i][0], p[1] - sheet[i][1]));
+    expect(Math.max(...err)).toBeLessThan(2);
+  });
+
   it("still fits well with the notch and no tool mask", () => {
     const paper = blank(W, H);
     fillPoly(paper, truth);

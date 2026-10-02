@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { measureVolume } from "replicad";
 import { beforeAll, describe, expect, it } from "vitest";
 import { planTiles } from "../src/lib/cad/geometry2d";
 import { initKernel } from "../src/lib/cad/init";
@@ -9,6 +10,8 @@ import type { Cutout, Pt } from "../src/lib/cad/types";
 
 const require = createRequire(import.meta.url);
 const bar = (x: number, y: number, w: number, h: number): Pt[] => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+/** Signed shoelace area (holes come out negative). */
+const ringArea = (r: Pt[]) => r.reduce((a, p, i) => { const q = r[(i + 1) % r.length]; return a + (p[0] * q[1] - q[0] * p[1]) / 2; }, 0);
 
 beforeAll(async () => {
   await initKernel(require.resolve("replicad-opencascadejs/wasm"));
@@ -73,6 +76,18 @@ describe("gridfinity solid", () => {
     expect(layout.tiles.length).toBe(2);
     expect(new Set(parts.map((p) => p.info.tile))).toEqual(new Set([0, 1]));
   }, 120_000);
+
+  it("drills magnet holes in every cell of a big bin quickly", () => {
+    // 8×8 cells: 256 holes. One-at-a-time cuts took over a minute here.
+    const big: Cutout[] = [{ id: "big", shape: { kind: "roundedRect", center: [0, 0], width: 300, height: 300 } }];
+    const plain = buildGridfinity(big, { magnets: "none" });
+    const t0 = performance.now();
+    const holed = buildGridfinity(big, { magnets: "all" });
+    expect(performance.now() - t0).toBeLessThan(30_000);
+    expect([holed.layout.cellsX, holed.layout.cellsY]).toEqual([8, 8]);
+    const tray = (r: typeof plain) => measureVolume(r.parts.find((p) => p.info.kind === "tray")!.solid);
+    expect(tray(plain) - tray(holed)).toBeCloseTo(256 * Math.PI * 3.25 ** 2 * 2.4, 0);
+  }, 120_000);
 });
 
 describe("foam", () => {
@@ -83,4 +98,35 @@ describe("foam", () => {
     expect(r.cutPaths.length).toBe(2); // panel outline + one merged cut
     expect(r.width).toBeCloseTo(80 + 3 + 30, 0);
   }, 60_000);
+
+  it("cuts overlapping and touching cutouts exactly", () => {
+    const rect = (id: string, x: number): Cutout => ({ id, shape: { kind: "roundedRect", center: [x, 0], width: 40, height: 20 } });
+    // a overlaps b, c touches b: one 100 × 20 hole in a 120 × 40 panel.
+    const r = buildFoam([rect("a", 0), rect("b", 20), rect("c", 60)], { tolerance: 0, thickness: 10, backer: 0, margin: 10 });
+    expect(measureVolume(r.parts[0].solid)).toBeCloseTo((120 * 40 - 100 * 20) * 10, 1);
+  }, 60_000);
+
+  it("cuts the whole finger slot next to a jagged outline", () => {
+    // Pocket-then-slot used to drop half of this slot.
+    let s = 23;
+    const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+    const pts: Pt[] = Array.from({ length: 120 }, (_, i) => {
+      const t = (i / 120) * 2 * Math.PI;
+      return [50 * Math.cos(t) + (rnd() - 0.5) * 0.3, 11 * Math.sin(t) + (rnd() - 0.5) * 0.3];
+    });
+    const r = buildFoam([{ id: "e", shape: { kind: "polygon", points: pts }, fingerSlot: true }], { tolerance: 1.5, thickness: 10, backer: 0 });
+    const removed = r.width * r.height - measureVolume(r.parts[0].solid) / 10;
+    const planned = r.cutPaths.slice(1).reduce((a, ring) => a + ringArea(ring), 0);
+    expect(Math.abs(removed - planned) / planned).toBeLessThan(0.01);
+  }, 60_000);
+
+  it("refuses zero-thickness layers and degenerate finger slots instead of hanging", () => {
+    // With a cutout, thickness 0 spins OpenCascade forever at the first cut. Without one there is
+    // no cut, so this can't hang even if the guards regress; 1e-9 gets past planFoam's own check.
+    const c: Cutout[] = [{ id: "a", shape: { kind: "polygon", points: bar(0, 0, 80, 20) }, fingerSlot: true }];
+    expect(() => buildFoam([], { thickness: 0 })).toThrow(/thick/i);
+    expect(() => buildFoam(c, { thickness: 1e-9 })).toThrow(/more than 0/);
+    expect(() => buildFoam(c, { fingerDiameter: 0 })).toThrow(/finger/i);
+    expect(() => buildGridfinity(c, { fingerDiameter: 0 })).toThrow(/finger/i);
+  });
 });

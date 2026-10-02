@@ -13,19 +13,65 @@ import type { Click, ToolItem } from "./types";
 const WORKING_MAX = 2048;
 
 let sam: Comlink.Remote<SamWorkerApi> | null = null;
-let cad: Comlink.Remote<CadWorkerApi> | null = null;
 
 export function samWorker() {
   sam ??= Comlink.wrap<SamWorkerApi>(new Worker(new URL("../workers/sam.worker.ts", import.meta.url), { type: "module" }));
   return sam;
 }
 
-export function cadWorker() {
+// ---------- CAD worker ----------
+
+type Cad = Comlink.Remote<CadWorkerApi>;
+let cad: { api: Cad; thread: Worker; busy: number; retired: boolean } | null = null;
+
+function cadHandle() {
   if (!cad) {
-    cad = Comlink.wrap<CadWorkerApi>(new Worker(new URL("../workers/cad.worker.ts", import.meta.url), { type: "module" }));
-    void cad.init("/fonts/label.ttf");
+    const thread = new Worker(new URL("../workers/cad.worker.ts", import.meta.url), { type: "module" });
+    cad = { api: Comlink.wrap<CadWorkerApi>(thread), thread, busy: 0, retired: false };
+    void cad.api.init("/fonts/label.ttf");
   }
   return cad;
+}
+
+/** wasm32 tops out at 4 GiB and OpenCascade's booleans leak a few MB each, so recycle well before that. */
+const CAD_HEAP_LIMIT = 2.5e9;
+/** A WASM fault leaves the OpenCascade instance corrupted: every later call fails. */
+const WASM_FAULT = /out of bounds|null function|signature mismatch|unreachable|WebAssembly|Unserializable/i;
+
+function retire(h: NonNullable<typeof cad>) {
+  h.retired = true;
+  if (cad === h) cad = null;
+}
+
+/**
+ * Run a CAD call. A worker that faulted or whose heap passed CAD_HEAP_LIMIT is retired: later
+ * calls get a fresh worker, and the old one is terminated once the calls queued on it settle.
+ * A faulted call is retried once on the fresh worker.
+ */
+export async function withCad<T>(call: (api: Cad) => Promise<T>, retry = true): Promise<T> {
+  const h = cadHandle();
+  h.busy++;
+  try {
+    const result = await call(h.api);
+    if (!h.retired && (await h.api.heapBytes().catch(() => 0)) > CAD_HEAP_LIMIT) retire(h);
+    return result;
+  } catch (e) {
+    if (!WASM_FAULT.test(e instanceof Error ? e.message : String(e))) throw e;
+    retire(h);
+    if (!retry) throw e;
+    return withCad(call, false);
+  } finally {
+    if (--h.busy === 0 && h.retired) h.thread.terminate();
+  }
+}
+
+/** Preview ids only ever grow (across remounts and recycled workers), so a worker can spot obsolete builds. */
+let previewId = 0;
+export const nextPreviewId = () => ++previewId;
+
+/** Let a queued preview skip, without starting a worker just to say so. */
+export function supersedeCadPreviews() {
+  if (cad) void cad.api.supersede(nextPreviewId());
 }
 
 interface Working {
@@ -46,8 +92,17 @@ const toolMasks = new Map<string, { mask: Mask; x0: number; y0: number }>();
 export const getWorking = () => working;
 
 const hashBlob = async (blob: Blob) => {
-  const buf = await crypto.subtle.digest("SHA-256", await blob.slice(0, 2_000_000).arrayBuffer());
-  return Array.from(new Uint8Array(buf).slice(0, 8)).map((b) => b.toString(16).padStart(2, "0")).join("") + blob.size.toString(36);
+  const head = await blob.slice(0, 2_000_000).arrayBuffer();
+  let hex: string;
+  if (globalThis.crypto?.subtle) {
+    hex = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", head)).slice(0, 8)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  } else {
+    // crypto.subtle only exists on https and localhost (not http://<LAN IP>); FNV-1a is plenty to key the embedding cache.
+    let h = 0x811c9dc5;
+    for (const b of new Uint8Array(head)) h = Math.imul(h ^ b, 0x01000193);
+    hex = (h >>> 0).toString(16).padStart(8, "0");
+  }
+  return hex + blob.size.toString(36);
 };
 
 /** Decode a photo (EXIF rotation applied), build the working copy, and start the model. */
@@ -71,7 +126,8 @@ export async function openImage(blob: Blob, name: string, keepProject = false) {
   }
   store.setImageInfo({ name, width, height, scale });
   store.setEmbedding("none");
-  store.setInteraction(store.corners ? { kind: "idle" } : { kind: "paper" });
+  // Read corners fresh: `store` is the snapshot from before resetProject.
+  store.setInteraction(useStore.getState().corners ? { kind: "idle" } : { kind: "paper" });
   store.setView("photo");
   if (store.settings.engine === "ai") void prepareModel();
 }
@@ -102,29 +158,39 @@ export async function prepareModel() {
   }
 }
 
-let embedding: Promise<void> | null = null;
+/** In-flight embeddings by photo id, so a new photo never waits on (or is mistaken for) the previous one's. */
+const embeddings = new Map<string, Promise<void>>();
 async function ensureEmbedding() {
-  if (!working) return;
-  const store = useStore.getState();
+  const cur = working;
+  if (!cur) return;
+  // Only the photo still on screen may update the store; a superseded one finishes quietly.
+  const isCurrent = () => working === cur;
   const w = samWorker();
-  if (await w.has(working.id)) {
-    store.setEmbedding("ready");
+  if (await w.has(cur.id)) {
+    if (isCurrent()) useStore.getState().setEmbedding("ready");
     return;
   }
-  embedding ??= (async () => {
-    store.setEmbedding("working");
-    try {
-      const copy = await createImageBitmap(working!.bitmap);
-      await w.embed(working!.id, Comlink.transfer(copy, [copy]));
-      useStore.getState().setEmbedding("ready");
-    } catch (e) {
-      useStore.getState().setEmbedding("error");
-      throw e;
-    } finally {
-      embedding = null;
-    }
-  })();
-  return embedding;
+  // Replaced meanwhile: don't spend seconds of encoder time on a photo nobody sees.
+  if (!isCurrent()) return;
+  useStore.getState().setEmbedding("working");
+  let job = embeddings.get(cur.id);
+  if (!job) {
+    job = (async () => {
+      const copy = await createImageBitmap(cur.bitmap);
+      await w.embed(cur.id, Comlink.transfer(copy, [copy]));
+    })();
+    embeddings.set(cur.id, job);
+    const done = () => embeddings.delete(cur.id);
+    job.then(done, done);
+  }
+  try {
+    await job;
+    if (isCurrent()) useStore.getState().setEmbedding("ready");
+  } catch (e) {
+    if (!isCurrent()) return;
+    useStore.getState().setEmbedding("error");
+    throw e;
+  }
 }
 
 const aiReady = () => {
@@ -165,13 +231,15 @@ export const onLatePreview = (f: (m: DecodedMask) => void) => {
 // ---------- segmentation ----------
 
 async function segment(clicks: Click[], choose: "tool" | "largest"): Promise<Mask> {
-  if (!working) throw new Error("Add a photo first");
+  const cur = working;
+  if (!cur) throw new Error("Add a photo first");
   if (aiReady()) {
-    const m = await samWorker().decode(working.id, clicks, choose);
+    await ensureEmbedding(); // re-embeds if the worker's cache evicted this photo
+    const m = await samWorker().decode(cur.id, clicks, choose);
     return largestComponent({ data: m.data, width: m.width, height: m.height });
   }
   // Simple mode (no model): brightness for the sheet, "not paper" for tools.
-  const { rgba, width: w, height: h } = working;
+  const { rgba, width: w, height: h } = cur;
   if (choose === "largest") return largestComponent(paperSelect(rgba, w, h, clicks[0].x, clicks[0].y));
   const corners = useStore.getState().corners;
   const pick = (c: Click) => {
@@ -243,10 +311,12 @@ function fullToolMasks(): Mask[] {
 /** Trace (or re-trace) a tool from its clicks, and add or update it in the project. */
 export async function traceTool(clicks: Click[], toolId: string | null, detail = false): Promise<string | null> {
   const store = useStore.getState();
-  if (!working || !clicks.some((c) => c.positive)) return toolId;
+  const cur = working;
+  if (!cur || !clicks.some((c) => c.positive)) return toolId;
   store.setBusy(detail ? "Tracing in detail…" : "Tracing…");
   try {
     const mask = await segment(clicks, "tool");
+    if (working !== cur) return toolId; // another photo was opened meanwhile
     let outlinePx = traceOuter(mask);
     if (outlinePx.length < 3) {
       store.notify({ tone: "warn", text: "Nothing found at that spot. Click directly on the tool." });
@@ -258,6 +328,7 @@ export async function traceTool(clicks: Click[], toolId: string | null, detail =
     }
     if (detail) {
       const fine = await detailOutline(mask, clicks).catch(() => null);
+      if (working !== cur) return toolId;
       if (fine) outlinePx = fine;
       else store.notify({ tone: "info", text: "Detail pass didn't improve this outline, so the standard trace was kept." });
     }
@@ -268,6 +339,7 @@ export async function traceTool(clicks: Click[], toolId: string | null, detail =
     const existing = s.tools.find((t) => t.id === id);
     const frame = frameFor(s.corners, s.settings.paper);
     const derived = frame ? outlineFromPixels(outlinePx, frame, detail) : null;
+    if (frame && !derived) store.notify({ tone: "warn", text: "This tool can't be measured with the current paper corners. Check that they sit on the sheet's corners." });
     const tool: ToolItem = {
       ...(existing ?? {
         id,
@@ -306,12 +378,16 @@ export function forgetToolMask(id: string) {
 /** Click on the sheet: segment it and fit its four corners. */
 export async function findPaper(x: number, y: number) {
   const store = useStore.getState();
-  if (!working) return;
+  const cur = working;
+  if (!cur) return;
   store.setBusy("Finding the paper…");
   try {
-    paperMask = await segment([{ x, y, positive: true }], "largest");
+    const mask = await segment([{ x, y, positive: true }], "largest");
+    if (working !== cur) return; // another photo was opened meanwhile
+    paperMask = mask;
     const fit = fitPaper(paperMask, fullToolMasks());
-    if (fit.fill < 0.85) store.notify({ tone: "warn", text: "The paper outline looks uneven. Drag the corner handles onto the sheet's corners." });
+    const sane = !!frameFor(fit.corners, useStore.getState().settings.paper) && fit.fill <= MAX_FILL;
+    if (!sane || fit.fill < 0.85) store.notify({ tone: "warn", text: "The paper outline looks uneven. Drag the corner handles onto the sheet's corners." });
     else store.notify(null);
     store.setCorners(fit.corners, false);
     store.setInteraction({ kind: "trace", clicks: [], toolId: null });
@@ -322,6 +398,23 @@ export async function findPaper(x: number, y: number) {
   }
 }
 
+/** A mask filling clearly more than its quad means the quad leaves part of the sheet out, i.e. it's wrong. */
+const MAX_FILL = 1.05;
+
+/**
+ * A refit must be a valid sheet. It may move the corners far only if it fills its quad almost
+ * exactly (a clean sheet correcting a first fit skewed by tools on the edge) or if the current
+ * corners aren't a valid sheet; otherwise it may only nudge them.
+ */
+function refitAcceptable(prev: Vec2[] | null, fit: { corners: Vec2[]; fill: number }, paper: Mask): boolean {
+  const kind = useStore.getState().settings.paper;
+  if (fit.fill > MAX_FILL || !frameFor(fit.corners, kind)) return false;
+  if (!prev || prev.length !== 4 || !frameFor(prev, kind)) return true;
+  if (fit.fill >= 0.95 && fit.fill <= 1.02) return true;
+  const limit = 0.05 * Math.hypot(paper.width, paper.height);
+  return fit.corners.every((c, i) => Math.hypot(c[0] - prev[i][0], c[1] - prev[i][1]) <= limit);
+}
+
 let refitTimer: ReturnType<typeof setTimeout> | undefined;
 async function refitPaper() {
   clearTimeout(refitTimer);
@@ -329,7 +422,8 @@ async function refitPaper() {
     const s = useStore.getState();
     if (!paperMask || s.cornersManual) return;
     try {
-      s.setCorners(fitPaper(paperMask, fullToolMasks()).corners, false);
+      const fit = fitPaper(paperMask, fullToolMasks());
+      if (refitAcceptable(s.corners, fit, paperMask)) s.setCorners(fit.corners, false);
     } catch {
       /* keep the previous corners */
     }

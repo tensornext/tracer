@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronDown, Download, FilePlus2, FolderOpen, ListTree, Save, SlidersHorizontal } from "lucide-react";
 import { zipSync } from "fflate";
 import { snapshot, useStore } from "../state/store";
-import { cadWorker, getWorking } from "../state/session";
+import { getWorking, withCad } from "../state/session";
 import { foamParams, gridfinityParams, placeOutline, planFor, usableTools } from "../state/geometry";
 import { download, toDXF, toSVG } from "../lib/export/files";
 import { APP_NAME, Seg } from "./ui";
@@ -90,13 +90,13 @@ function ExportMenu() {
   const name = (useStore.getState().image?.name ?? "toolbed").replace(/\.[^.]+$/, "");
   const ready = usableTools(tools).length > 0;
 
-  const build = async () => {
+  // The worker builds and exports in one call, so a preview build can't swap the model in between.
+  const request = () => {
     const plan = planFor(tools, settings);
     if (plan.kind === "error") throw new Error(plan.message);
-    const cad = cadWorker();
-    if (settings.mode === "gridfinity") await cad.buildGridfinity(plan.cutouts, { ...gridfinityParams(settings), center: plan.kind === "gridfinity" ? plan.plan.layout.center : undefined });
-    else await cad.buildFoam(plan.cutouts, foamParams(settings));
-    return { cad, plan };
+    return plan.kind === "gridfinity"
+      ? { mode: plan.kind, cutouts: plan.cutouts, params: { ...gridfinityParams(settings), center: plan.plan.layout.center } }
+      : { mode: plan.kind, cutouts: plan.cutouts, params: foamParams(settings) };
   };
 
   const run = async (label: string, f: () => Promise<void>) => {
@@ -114,19 +114,19 @@ function ExportMenu() {
   const items =
     settings.mode === "gridfinity"
       ? [
-          { label: "3MF for your slicer", hint: "Bin and contrast floors as separate parts", f: async () => { const { cad } = await build(); download(await cad.export3MF(), `${name}.3mf`, "model/3mf"); } },
-          { label: "STL", hint: "One file per part, zipped if more than one", f: async () => stl(await build()) },
-          { label: "STEP", hint: "Editable solid for CAD", f: async () => { const { cad } = await build(); download(await cad.exportSTEP(), `${name}.step`, "model/step"); } },
+          { label: "3MF for your slicer", hint: "Bin and contrast floors as separate parts", f: async () => download(await withCad((w) => w.export3MF(request())), `${name}.3mf`, "model/3mf") },
+          { label: "STL", hint: "One file per part, zipped if more than one", f: stl },
+          { label: "STEP", hint: "Editable solid for CAD", f: async () => download(await withCad((w) => w.exportSTEP(request())), `${name}.step`, "model/step") },
         ]
       : [
           { label: "DXF", hint: "For laser, waterjet or CNC", f: async () => { const p = planFor(tools, settings); if (p.kind !== "foam") throw new Error("Nothing to cut yet"); download(toDXF(p.plan.cutPaths), `${name}-foam.dxf`, "application/dxf"); } },
           { label: "SVG", hint: "Real-size vector, cuts in red", f: async () => { const p = planFor(tools, settings); if (p.kind !== "foam") throw new Error("Nothing to cut yet"); download(toSVG(p.plan.cutPaths), `${name}-foam.svg`, "image/svg+xml"); } },
-          { label: "STEP", hint: "Foam layers as solids", f: async () => { const { cad } = await build(); download(await cad.exportSTEP(), `${name}-foam.step`, "model/step"); } },
-          { label: "STL", hint: "Foam layers as meshes", f: async () => stl(await build()) },
+          { label: "STEP", hint: "Foam layers as solids", f: async () => download(await withCad((w) => w.exportSTEP(request())), `${name}-foam.step`, "model/step") },
+          { label: "STL", hint: "Foam layers as meshes", f: stl },
         ];
 
-  async function stl({ cad }: Awaited<ReturnType<typeof build>>) {
-    const files = await cad.exportSTL();
+  async function stl() {
+    const files = await withCad((w) => w.exportSTL(request()));
     if (files.length === 1) return download(files[0].data, `${name}-${files[0].name}`, "model/stl");
     download(zipSync(Object.fromEntries(files.map((f) => [f.name, new Uint8Array(f.data)]))) as Uint8Array<ArrayBuffer>, `${name}-stl.zip`, "application/zip");
   }

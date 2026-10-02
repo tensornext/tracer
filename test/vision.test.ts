@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyHomography, homographyFrom4, orderCorners, paperFrame, uniformScale, type Vec2 } from "../src/lib/vision/paper";
+import { applyHomography, homographyFrom4, orderCorners, outlineToMm, paperFrame, uniformScale, type Vec2 } from "../src/lib/vision/paper";
 import { resampleClosed, simplifyClosed, smoothOutline } from "../src/lib/vision/smoothing";
 
 // Simulate a phone photo: paper-plane mm (Y-up) → image px through a tilted-camera homography.
@@ -52,6 +52,23 @@ describe("paper homography", () => {
     expect(f.width).toBeCloseTo(279.4);
     expect(f.mmPerPxAtCenter).toBeCloseTo(0.1, 3);
   });
+
+  it("rejects corners that can't be a photographed sheet", () => {
+    expect(() => paperFrame(cornersPx, "letter")).not.toThrow();
+    // Two corners almost on top of each other (what a bad refit used to produce).
+    expect(() => paperFrame([[550, 154], [1500, 154], [1500, 154.0000003], [550, 1384]], "letter")).toThrow();
+    // A corner dragged inside the sheet: concave.
+    expect(() => paperFrame([[550, 154], [1500, 154], [900, 700], [550, 1384]], "letter")).toThrow();
+  });
+
+  it("refuses to map outline points at the horizon", () => {
+    const f = paperFrame(cornersPx, "letter");
+    const [, , , , , , h6, h7, h8] = f.H;
+    const onHorizon: Vec2 = [0, -h8 / h7]; // projective depth 0: millimetres go to infinity here
+    expect(outlineToMm([toImage([20, 30]), toImage([200, 260])], f)).not.toBeNull();
+    expect(outlineToMm([toImage([20, 30]), onHorizon, toImage([200, 260])], f)).toBeNull();
+    expect(h6 * onHorizon[0] + h7 * onHorizon[1] + h8).toBeCloseTo(0, 6);
+  });
 });
 
 describe("outline smoothing", () => {
@@ -66,6 +83,12 @@ describe("outline smoothing", () => {
     const out = resampleClosed(noisy, 0.5);
     const perimeter = 2 * Math.PI * 20;
     expect(out.length).toBeGreaterThan(perimeter / 0.5 * 0.9);
+  });
+
+  it("caps the sample count for a runaway outline instead of freezing", () => {
+    const huge: Vec2[] = [[0, 0], [1e18, 0], [1e18, 1e18], [0, 1e18]];
+    expect(resampleClosed(huge, 0.5).length).toBeLessThanOrEqual(20_000);
+    expect(resampleClosed([[0, 0], [Infinity, 0], [0, 1]], 0.5)).toHaveLength(3);
   });
 
   it("fast mode removes jitter and simplifies; detail keeps more points", () => {

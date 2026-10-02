@@ -31,7 +31,8 @@ function otsu(values: Uint8Array): number {
 /** 4-connected component of `mask` containing (x, y). */
 function componentAt(mask: Uint8Array, w: number, h: number, x: number, y: number): Uint8Array {
   const out = new Uint8Array(w * h);
-  const seed = Math.round(y) * w + Math.round(x);
+  // Clamp: a click in the last half-pixel would otherwise round onto the next row.
+  const seed = Math.min(h - 1, Math.max(0, Math.round(y))) * w + Math.min(w - 1, Math.max(0, Math.round(x)));
   if (!mask[seed]) return out;
   const q = new Int32Array(w * h);
   let head = 0, tail = 0;
@@ -145,7 +146,7 @@ export function toolSelectOnPaper(rgba: Uint8ClampedArray, w: number, h: number,
     notPaper[i] = lum[i] < 0.72 * bg(i % w, (i / w) | 0) || chroma > 60 ? 1 : 0;
   }
   // If the click landed on a highlight, start from the nearest non-paper pixel instead.
-  const sx = Math.round(x), sy = Math.round(y);
+  const sx = Math.min(w - 1, Math.max(0, Math.round(x))), sy = Math.min(h - 1, Math.max(0, Math.round(y)));
   if (!notPaper[sy * w + sx]) {
     let best = Infinity;
     for (let dy = -15; dy <= 15; dy++) for (let dx = -15; dx <= 15; dx++) {

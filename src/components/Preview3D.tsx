@@ -3,9 +3,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { Loader2 } from "lucide-react";
 import { useStore } from "../state/store";
-import { cadWorker } from "../state/session";
+import { nextPreviewId, supersedeCadPreviews, withCad } from "../state/session";
 import { foamParams, gridfinityParams, planFor } from "../state/geometry";
 import type { MeshData } from "../lib/cad/kernel";
+import type { BuildRequest } from "../workers/cad.worker";
 
 const COLORS: Record<string, number> = { tray: 0x8a8f98, contrast: 0xf26a1b, foamCut: 0x3a4044, foamBacker: 0x5b6166 };
 
@@ -56,22 +57,32 @@ export function Preview3D() {
       setState(plan.kind === "error" ? { status: "error", message: plan.message } : { status: "idle" });
       return;
     }
-    let cancelled = false;
+    const req: BuildRequest = plan.kind === "gridfinity"
+      ? { mode: "gridfinity", cutouts: plan.cutouts, params: { ...gridfinityParams(settings), center: plan.plan.layout.center } }
+      : { mode: "foam", cutouts: plan.cutouts, params: foamParams(settings) };
+    let cancelled = false, pending = false;
     const timer = setTimeout(async () => {
       setState({ status: "building" });
+      pending = true;
       try {
-        const cad = cadWorker();
-        if (settings.mode === "gridfinity") await cad.buildGridfinity(plan.cutouts, { ...gridfinityParams(settings), center: plan.kind === "gridfinity" ? plan.plan.layout.center : undefined });
-        else await cad.buildFoam(plan.cutouts, foamParams(settings));
-        const meshes = (await cad.meshes()) as MeshData[];
-        if (cancelled || !three.current) return;
+        const id = nextPreviewId();
+        const meshes = await withCad((w) => w.preview(id, req));
+        // null: superseded by a newer request before the worker got to it.
+        if (cancelled || !meshes || !three.current) return;
         show(meshes);
         setState({ status: "ready" });
       } catch (e) {
         if (!cancelled) setState({ status: "error", message: e instanceof Error ? e.message : String(e) });
+      } finally {
+        pending = false;
       }
     }, 350);
-    return () => { cancelled = true; clearTimeout(timer); };
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      // Still queued in the worker (say the view closed and no newer build follows): let it skip.
+      if (pending) supersedeCadPreviews();
+    };
   }, [plan, settings]);
 
   function show(meshes: MeshData[]) {

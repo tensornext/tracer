@@ -88,6 +88,9 @@ function pickIndex(scores: number[], areas: number[], total: number, choose: Cho
 async function runDecoder(id: string, clicks: Click[], box?: [number, number, number, number]) {
   const e = cache.get(id);
   if (!e) throw new Error("Image is not ready yet");
+  // Least-recently-used eviction: keep the photo being clicked on ahead of detail-pass crops.
+  cache.delete(id);
+  cache.set(id, e);
   const { original_sizes, reshaped_input_sizes } = e.inputs;
   const input: Record<string, Tensor> = { ...e.embeddings };
   if (clicks.length) {

@@ -84,12 +84,39 @@ export interface PaperFrame {
    * starts to show (parallax), so warn the user.
    */
   obliqueness: number;
+  /** Centre of the corner quad, image px. */
+  centerPx: Vec2;
 }
 
 const dist = (a: Vec2, b: Vec2) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
+/** Smallest corner angle (degrees) a photographed sheet can plausibly show. */
+const MIN_CORNER_ANGLE = 15;
+
+/**
+ * Throw unless ordered corners can be a photographed sheet: finite, convex, no sliver corners
+ * and no collapsed side. Anything else gives a homography whose horizon cuts through the
+ * photo, and outlines near it come out kilometres long.
+ */
+function checkQuad(q: Vec2[]) {
+  if (!q.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y))) throw new Error("Paper corners aren't finite");
+  const sides = q.map((p, i) => dist(p, q[(i + 1) % 4]));
+  // Written as !(ok) so a NaN fails the check instead of slipping through.
+  if (!(Math.min(...sides) > 0.1 * Math.max(...sides))) throw new Error("Two paper corners are almost on top of each other");
+  const minSin = Math.sin((MIN_CORNER_ANGLE * Math.PI) / 180);
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = q[(i + 3) % 4], b = q[i], c = q[(i + 1) % 4];
+    const turn = ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])) / (sides[(i + 3) % 4] * sides[i]);
+    if (!(Math.abs(turn) >= minSin) || (sign !== 0 && Math.sign(turn) !== sign)) throw new Error("The paper corners don't form a sheet");
+    sign = Math.sign(turn);
+  }
+}
+
 export function paperFrame(cornersPx: Vec2[], paper: PaperType): PaperFrame {
-  const [tl, tr, br, bl] = orderCorners(cornersPx);
+  const q = orderCorners(cornersPx);
+  checkQuad(q);
+  const [tl, tr, br, bl] = q;
   const top = dist(tl, tr), bottom = dist(bl, br), left = dist(tl, bl), right = dist(tr, br);
   const orientation = (top + bottom) / 2 > (left + right) / 2 ? "landscape" : "portrait";
   const size = PAPER_SIZES[paper];
@@ -101,12 +128,21 @@ export function paperFrame(cornersPx: Vec2[], paper: PaperType): PaperFrame {
   const a = applyHomography(H, [c[0] - 0.5, c[1]]);
   const b = applyHomography(H, [c[0] + 0.5, c[1]]);
   const obliqueness = Math.max(top / bottom, bottom / top, left / right, right / left);
-  return { H, orientation, width, height, mmPerPxAtCenter: dist(a, b), obliqueness };
+  return { H, orientation, width, height, mmPerPxAtCenter: dist(a, b), obliqueness, centerPx: c };
 }
 
-/** Map a traced outline (image px) to paper millimetres. */
-export function outlineToMm(outlinePx: Vec2[], frame: PaperFrame): Vec2[] {
-  return outlinePx.map((p) => applyHomography(frame.H, p));
+/**
+ * Map a traced outline (image px) to paper millimetres. Returns null if any point lies near or
+ * past the homography's horizon (its projective depth under a fifth of the sheet centre's),
+ * where the mapping stretches without bound.
+ */
+export function outlineToMm(outlinePx: Vec2[], frame: PaperFrame): Vec2[] | null {
+  const { H, centerPx } = frame;
+  const depth = ([x, y]: Vec2) => H[6] * x + H[7] * y + H[8];
+  const d0 = depth(centerPx);
+  if (!outlinePx.every((p) => depth(p) / d0 >= 0.2)) return null;
+  const mm = outlinePx.map((p) => applyHomography(H, p));
+  return mm.every(([x, y]) => Number.isFinite(x) && Number.isFinite(y)) ? mm : null;
 }
 
 /** The uniform-scale approach (average side lengths), kept for comparison and tests. */
